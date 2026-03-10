@@ -3,10 +3,64 @@ import { auth } from '@clerk/nextjs/server'
 import { client } from '@/lib/anthropic'
 import { supabase } from '@/lib/supabase'
 
+const FREE_LIMIT = 5
+
+async function checkAndIncrementUsage(userId: string): Promise<{ allowed: boolean; count: number }> {
+  const today = new Date().toISOString().split('T')[0]
+
+  const { data: usage } = await supabase
+    .from('usage')
+    .select('quote_count, reset_date')
+    .eq('user_id', userId)
+    .single()
+
+  if (usage) {
+    const resetDate = new Date(usage.reset_date)
+    const daysSinceReset = Math.floor((Date.now() - resetDate.getTime()) / (1000 * 60 * 60 * 24))
+
+    // Reset if more than 30 days since last reset
+    if (daysSinceReset >= 30) {
+      await supabase
+        .from('usage')
+        .update({ quote_count: 1, reset_date: today })
+        .eq('user_id', userId)
+      return { allowed: true, count: 1 }
+    }
+
+    if (usage.quote_count >= FREE_LIMIT) {
+      return { allowed: false, count: usage.quote_count }
+    }
+
+    await supabase
+      .from('usage')
+      .update({ quote_count: usage.quote_count + 1 })
+      .eq('user_id', userId)
+
+    return { allowed: true, count: usage.quote_count + 1 }
+  }
+
+  // First quote ever — create the row
+  await supabase
+    .from('usage')
+    .insert({ user_id: userId, quote_count: 1, reset_date: today })
+
+  return { allowed: true, count: 1 }
+}
+
 export async function POST(request: Request) {
   try {
     const { userId } = await auth()
     const { jobDescription } = await request.json()
+
+    if (userId) {
+      const { allowed, count } = await checkAndIncrementUsage(userId)
+      if (!allowed) {
+        return NextResponse.json(
+          { error: 'Free limit reached. Upgrade to Pro.', count },
+          { status: 403 }
+        )
+      }
+    }
 
     const message = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -36,7 +90,7 @@ Use realistic Vancouver BC market rates. GST is 5%.`,
     const cleaned = rawText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim()
     const quote = JSON.parse(cleaned)
 
-    await supabase.from('quotes').insert({
+    const { error: dbError } = await supabase.from('quotes').insert({
       user_id: userId,
       client_name: quote.clientName,
       job_title: quote.jobTitle,
@@ -51,6 +105,8 @@ Use realistic Vancouver BC market rates. GST is 5%.`,
       estimated_days: quote.estimatedDays,
       notes: quote.notes,
     })
+
+    if (dbError) console.error('Supabase insert error:', dbError)
 
     return NextResponse.json(quote)
   } catch (error) {
